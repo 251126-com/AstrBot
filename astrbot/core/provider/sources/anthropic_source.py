@@ -12,8 +12,15 @@ from anthropic.types.usage import Usage
 
 from astrbot import logger
 from astrbot.api.provider import Provider
-from astrbot.core.agent.message import AudioURLPart, ContentPart, ImageURLPart, TextPart
+from astrbot.core.agent.message import (
+    AudioURLPart,
+    ContentPart,
+    ImageRefPart,
+    ImageURLPart,
+    TextPart,
+)
 from astrbot.core.exceptions import EmptyModelOutputError
+from astrbot.core.image_request_budget import current_image_request
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.func_tool_manager import ToolSet
 from astrbot.core.utils.media_utils import (
@@ -36,6 +43,7 @@ from .request_retry import retry_provider_request, retry_provider_request_contex
     "Anthropic Claude API 提供商适配器",
 )
 class ProviderAnthropic(Provider):
+    image_request_budget_supported = True
     _PROMPT_CACHE_CONTROL = {"type": "ephemeral"}
 
     @staticmethod
@@ -535,13 +543,18 @@ class ProviderAnthropic(Provider):
         try:
             completion = await retry_provider_request(
                 "Anthropic",
-                lambda: self.client.messages.create(
+                lambda: (
+                    self.client.with_options(max_retries=0)
+                    if current_image_request.get() is not None
+                    else self.client
+                ).messages.create(
                     **payloads,
                     stream=False,
                     extra_body=extra_body,
                     extra_headers=build_conversation_headers(conversation_id),
                 ),
                 max_attempts=request_max_retries,
+                image_request_payload={**payloads, **extra_body},
             )
         except httpx.RequestError as e:
             proxy = self.provider_config.get("proxy", "")
@@ -580,6 +593,8 @@ class ProviderAnthropic(Provider):
 
         llm_response.id = completion.id
         llm_response.usage = self._extract_usage(completion.usage)
+        if completion.usage is None and current_image_request.get() is not None:
+            llm_response.usage = None
 
         # Handle cases where completion only contains ThinkingBlock (e.g., MiniMax max_tokens)
         # When stop_reason='max_tokens', the model may return only thinking content
@@ -628,6 +643,7 @@ class ProviderAnthropic(Provider):
         final_tool_calls = []
         id = None
         usage = TokenUsage()
+        usage_known = False
         extra_body = self.provider_config.get("custom_extra_body", {})
         reasoning_content = ""
         reasoning_signature = ""
@@ -640,12 +656,17 @@ class ProviderAnthropic(Provider):
 
         async with retry_provider_request_context(
             "Anthropic",
-            lambda: self.client.messages.stream(
+            lambda: (
+                self.client.with_options(max_retries=0)
+                if current_image_request.get() is not None
+                else self.client
+            ).messages.stream(
                 **payloads,
                 extra_body=extra_body,
                 extra_headers=build_conversation_headers(conversation_id),
             ),
             max_attempts=request_max_retries,
+            image_request_payload={**payloads, **extra_body},
         ) as stream:
             assert isinstance(stream, anthropic.AsyncMessageStream)
             async for event in stream:
@@ -653,6 +674,7 @@ class ProviderAnthropic(Provider):
                     # the usage contains input token usage
                     id = event.message.id
                     usage = self._extract_usage(event.message.usage)
+                    usage_known = event.message.usage is not None
                 if event.type == "content_block_start":
                     if event.content_block.type == "text":
                         # 文本块开始
@@ -751,7 +773,9 @@ class ProviderAnthropic(Provider):
             role="assistant",
             completion_text=final_text,
             is_chunk=False,
-            usage=usage,
+            usage=(
+                usage if usage_known or current_image_request.get() is None else None
+            ),
             id=id,
             reasoning_content=reasoning_content,
             reasoning_signature=reasoning_signature or None,
@@ -812,10 +836,44 @@ class ProviderAnthropic(Provider):
         # tool calls result
         if tool_calls_result:
             if not isinstance(tool_calls_result, list):
-                context_query.extend(tool_calls_result.to_openai_messages())
+                context_query.extend(
+                    self._ensure_message_to_dicts(
+                        tool_calls_result.to_openai_messages()
+                    )
+                )
             else:
                 for tool_call_result in tool_calls_result:
-                    context_query.extend(tool_call_result.to_openai_messages())
+                    context_query.extend(
+                        self._ensure_message_to_dicts(
+                            tool_call_result.to_openai_messages()
+                        )
+                    )
+
+        # Gallery history carries local previews until the provider boundary.
+        # Copy each replaced part so the caller's history keeps its references.
+        encoded_previews = {}
+        for message in context_query:
+            if message.get("role") != "user" or not isinstance(
+                message.get("content"), list
+            ):
+                continue
+            for index, part in enumerate(message["content"]):
+                if part.get("type") != "image_url":
+                    continue
+                image_url = part.get("image_url", {})
+                url = image_url.get("url", "")
+                if not url or url.startswith(("data:", "http:", "https:")):
+                    continue
+                if url not in encoded_previews:
+                    resolved = await resolve_media_ref_to_base64_data(
+                        url, media_type="image"
+                    )
+                    encoded_previews[url] = resolved.to_data_url() if resolved else None
+                if encoded_previews[url] is not None:
+                    message["content"][index] = {
+                        **part,
+                        "image_url": {**image_url, "url": encoded_previews[url]},
+                    }
 
         system_prompt, new_messages = self._prepare_payload(context_query)
 
@@ -889,10 +947,44 @@ class ProviderAnthropic(Provider):
         # tool calls result
         if tool_calls_result:
             if not isinstance(tool_calls_result, list):
-                context_query.extend(tool_calls_result.to_openai_messages())
+                context_query.extend(
+                    self._ensure_message_to_dicts(
+                        tool_calls_result.to_openai_messages()
+                    )
+                )
             else:
                 for tool_call_result in tool_calls_result:
-                    context_query.extend(tool_call_result.to_openai_messages())
+                    context_query.extend(
+                        self._ensure_message_to_dicts(
+                            tool_call_result.to_openai_messages()
+                        )
+                    )
+
+        # Gallery history carries local previews until the provider boundary.
+        # Copy each replaced part so the caller's history keeps its references.
+        encoded_previews = {}
+        for message in context_query:
+            if message.get("role") != "user" or not isinstance(
+                message.get("content"), list
+            ):
+                continue
+            for index, part in enumerate(message["content"]):
+                if part.get("type") != "image_url":
+                    continue
+                image_url = part.get("image_url", {})
+                url = image_url.get("url", "")
+                if not url or url.startswith(("data:", "http:", "https:")):
+                    continue
+                if url not in encoded_previews:
+                    resolved = await resolve_media_ref_to_base64_data(
+                        url, media_type="image"
+                    )
+                    encoded_previews[url] = resolved.to_data_url() if resolved else None
+                if encoded_previews[url] is not None:
+                    message["content"][index] = {
+                        **part,
+                        "image_url": {**image_url, "url": encoded_previews[url]},
+                    }
 
         system_prompt, new_messages = self._prepare_payload(context_query)
 
@@ -979,6 +1071,8 @@ class ProviderAnthropic(Provider):
             for block in extra_user_content_parts:
                 if isinstance(block, TextPart):
                     content.append({"type": "text", "text": block.text})
+                elif isinstance(block, ImageRefPart):
+                    content.append({"type": "text", "text": block.to_text()})
                 elif isinstance(block, ImageURLPart):
                     image_dict = await resolve_image_url(block.image_url.url)
                     if image_dict:

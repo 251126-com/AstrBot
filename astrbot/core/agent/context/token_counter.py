@@ -1,8 +1,16 @@
+import copy
 import json
 import re
 from typing import Protocol, runtime_checkable
 
-from ..message import AudioURLPart, ImageURLPart, Message, TextPart, ThinkPart
+from ..message import (
+    AudioURLPart,
+    ImageRefPart,
+    ImageURLPart,
+    Message,
+    TextPart,
+    ThinkPart,
+)
 
 
 @runtime_checkable
@@ -70,6 +78,8 @@ class EstimateTokenCounter:
                         total += self._estimate_tokens(part.text)
                     elif isinstance(part, ThinkPart):
                         total += self._estimate_tokens(part.think)
+                    elif isinstance(part, ImageRefPart):
+                        total += self._estimate_tokens(part.to_text())
                     elif isinstance(part, ImageURLPart):
                         total += IMAGE_TOKEN_ESTIMATE
                     elif isinstance(part, AudioURLPart):
@@ -89,3 +99,110 @@ class EstimateTokenCounter:
         return int(
             chinese_count * 0.6 + emoji_count * EMOJI_TOKEN_ESTIMATE + other_count * 0.3
         )
+
+
+async def estimate_preview_tokens(previews) -> dict:
+    """Estimate visual context from local preview dimensions, never encoded length.
+
+    Args:
+        previews: Trusted local model-preview paths, one per image submission.
+
+    Returns:
+        Heuristic tokens and per-image dimensions; unknown images are explicit.
+        This model-independent tile heuristic is not a provider pricing formula.
+        Unknown images contribute no invented tokens; byte/count budgets still apply.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from PIL import Image
+
+    from astrbot.core.utils.media_utils import is_recoverable_image_error
+
+    def inspect():
+        images = []
+        for preview in previews:
+            item = {"status": "unknown", "tokens": None, "width": None, "height": None}
+            try:
+                # This estimator must never download URLs or decode inline base64.
+                if isinstance(preview, (str, Path)) and not str(preview).startswith(
+                    ("data:", "http:", "https:", "base64:")
+                ):
+                    with Image.open(Path(preview)) as image:
+                        width, height = image.size
+                    if width > 0 and height > 0:
+                        item = {
+                            "status": "heuristic",
+                            "width": width,
+                            "height": height,
+                            "tokens": 256
+                            * (1 + ((width + 511) // 512) * ((height + 511) // 512)),
+                        }
+            except OSError as exc:
+                if not is_recoverable_image_error(exc):
+                    raise
+            except (ValueError, TypeError):
+                pass
+            images.append(item)
+        unknown = sum(item["status"] == "unknown" for item in images)
+        return {
+            "tokens": sum(item["tokens"] or 0 for item in images),
+            "status": "unknown" if unknown else "heuristic",
+            "unknown_images": unknown,
+            "images": images,
+        }
+
+    # Only metadata is inspected; decompression and provider requests are excluded.
+    previews = tuple(previews)
+    return await asyncio.to_thread(inspect)
+
+
+async def count_projected_tokens(
+    messages, image_context, token_counter, *, provider=None
+) -> int:
+    """Count projected visual inputs using their prepared image dimensions.
+
+    Args:
+        messages: Request-only messages returned by ``project_messages``.
+        image_context: Turn state containing current inputs not already projected.
+        token_counter: Text and non-image token counter.
+        provider: Optional model used for this projection instead of the active chat model.
+
+    Returns:
+        Estimated total tokens, counting every image position in the request.
+    """
+    provider = provider or image_context.provider
+    modalities = getattr(provider, "provider_config", {}).get("modalities")
+    supports_image = (not modalities or "image" in modalities) and getattr(
+        provider, "image_request_budget_supported", False
+    ) is True
+    projected = copy.deepcopy(messages)
+    previews = []
+    projected_occurrences = set(image_context.projected_visuals)
+    for message in projected:
+        if not isinstance(message.content, list):
+            continue
+        kept_parts = []
+        for part in message.content:
+            if isinstance(part, ImageURLPart):
+                if (
+                    supports_image
+                    and image_context.projected_visuals.get(part.image_url.id)
+                    == part.image_url.url
+                ):
+                    previews.append(part.image_url.url)
+            else:
+                kept_parts.append(part)
+        message.content = kept_parts or ""
+
+    if supports_image:
+        previews.extend(
+            preview
+            for occurrence, preview in image_context.pending_visuals.items()
+            if occurrence not in projected_occurrences
+            and occurrence not in image_context.revoked_occurrences
+        )
+
+    estimates = await estimate_preview_tokens(previews)
+    unknown_tokens = estimates["unknown_images"] * IMAGE_TOKEN_ESTIMATE
+    return token_counter.count_tokens(projected) + estimates["tokens"] + unknown_tokens

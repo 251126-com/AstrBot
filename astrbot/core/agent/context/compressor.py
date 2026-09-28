@@ -1,11 +1,20 @@
+from contextlib import nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from astrbot.core.image_request_budget import ImageBudgetExceeded
+from astrbot.core.utils.media_utils import is_recoverable_image_error
 
 from ...provider.modalities import (
     log_context_sanitize_stats,
     sanitize_contexts_by_modalities,
 )
-from ..message import Message
-from .token_counter import EstimateTokenCounter, TokenCounter
+from ..message import ImageURLPart, Message, TextPart
+from .token_counter import (
+    EstimateTokenCounter,
+    TokenCounter,
+    count_projected_tokens,
+)
 
 if TYPE_CHECKING:
     from astrbot import logger
@@ -18,6 +27,7 @@ else:
         logger = logging.getLogger("astrbot")
 
 if TYPE_CHECKING:
+    from astrbot.core.image_context import ImageTurnContext
     from astrbot.core.provider.provider import Provider
 
 from ..context.truncator import ContextTruncator
@@ -130,6 +140,8 @@ class LLMSummaryCompressor:
         instruction_text: str | None = None,
         compression_threshold: float = 0.82,
         token_counter: TokenCounter | None = None,
+        strip_images: bool = False,
+        image_context: "ImageTurnContext | None" = None,
     ) -> None:
         """Initialize the LLM summary compressor.
 
@@ -139,11 +151,16 @@ class LLMSummaryCompressor:
                 exact context. Clamped to 0-0.3.
             instruction_text: Custom instruction for summary generation.
             compression_threshold: The compression trigger threshold (default: 0.82).
+            token_counter: Optional context token estimator.
+            strip_images: Whether summary requests must omit unmanaged inline images.
+            image_context: Optional authorized request-only image projection.
         """
         self.provider = provider
         self.keep_recent_ratio = min(max(float(keep_recent_ratio), 0.0), 0.3)
         self.compression_threshold = compression_threshold
         self.token_counter = token_counter or EstimateTokenCounter()
+        self.strip_images = strip_images
+        self.image_context = image_context
 
         self.instruction_text = instruction_text or (
             "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
@@ -177,6 +194,7 @@ class LLMSummaryCompressor:
         self,
         rounds: list[list[Message]],
         total_tokens: int,
+        count_rounds: list[list[Message]] | None = None,
     ) -> tuple[list[list[Message]], list[list[Message]]]:
         """Split rounds into summarised history and exact recent context.
 
@@ -195,7 +213,9 @@ class LLMSummaryCompressor:
         recent_start = len(rounds)
 
         for idx in range(len(rounds) - 1, -1, -1):
-            round_tokens = self.token_counter.count_tokens(rounds[idx])
+            round_tokens = self.token_counter.count_tokens(
+                count_rounds[idx] if count_rounds is not None else rounds[idx]
+            )
             if used > 0 and used + round_tokens > budget:
                 break
             used += round_tokens
@@ -216,10 +236,25 @@ class LLMSummaryCompressor:
         message_rounds = [
             [seg for seg in rnd if isinstance(seg, Message)] for rnd in rounds
         ]
-        total_tokens = self.token_counter.count_tokens(messages)
+        count_messages = messages
+        if self.image_context is not None:
+            count_messages = await self.image_context.project_messages(
+                messages, provider=self.provider
+            )
+            total_tokens = await count_projected_tokens(
+                count_messages,
+                self.image_context,
+                self.token_counter,
+                provider=self.provider,
+            )
+        else:
+            total_tokens = self.token_counter.count_tokens(count_messages)
         old_rounds, recent_rounds = self._split_recent_rounds_by_token_ratio(
             message_rounds,
             total_tokens,
+            [list(rnd) for rnd in split_into_rounds(count_messages)]
+            if self.image_context is not None
+            else None,
         )
 
         # The latest user message is the active request. Keep its whole round
@@ -265,6 +300,25 @@ class LLMSummaryCompressor:
                 ),
             )
         )
+        if self.image_context is not None:
+            summary_contexts = await self.image_context.project_messages(
+                summary_contexts, provider=self.provider
+            )
+            for message in summary_contexts:
+                if isinstance(message.content, list):
+                    message.content = [
+                        TextPart(text="[Image unavailable]")
+                        if isinstance(part, ImageURLPart)
+                        and self.image_context.projected_visuals.get(part.image_url.id)
+                        != part.image_url.url
+                        else part
+                        for part in message.content
+                    ]
+        if self.strip_images and self.image_context is None:
+            # Build a request-only text view; do not migrate the stored history.
+            summary_contexts, _ = sanitize_contexts_by_modalities(
+                summary_contexts, ["text", "audio", "tool_use"]
+            )
         sanitized_summary_contexts, sanitize_stats = sanitize_contexts_by_modalities(
             summary_contexts,
             self.provider.provider_config.get("modalities", None),
@@ -273,11 +327,110 @@ class LLMSummaryCompressor:
 
         # Generate summary
         try:
-            response = await self.provider.text_chat(
-                contexts=sanitized_summary_contexts,
-            )
+            scope = nullcontext()
+            image_ids = set()
+            image_count = 0
+            encoded_bytes = 0
+            if self.image_context is not None:
+                image_ids = set(self.image_context.projected_visuals)
+                authorized_ids = await self.image_context.authorize_visuals(image_ids)
+                if self.image_context.revoked:
+                    authorized_ids.clear()
+                if len(authorized_ids) != len(image_ids):
+                    for message in sanitized_summary_contexts:
+                        if not isinstance(message.get("content"), list):
+                            continue
+                        message["content"] = [
+                            (
+                                {
+                                    "type": "text",
+                                    "text": "[Image reference unavailable in this conversation]",
+                                }
+                                if isinstance(part, dict)
+                                and part.get("type") == "image_url"
+                                and isinstance(part.get("image_url"), dict)
+                                and part["image_url"].get("id")
+                                in image_ids - authorized_ids
+                                else part
+                            )
+                            for part in message["content"]
+                        ]
+                image_ids = authorized_ids
+                if (
+                    image_ids
+                    and getattr(self.provider, "image_request_budget_supported", False)
+                    is not True
+                ):
+                    for message in sanitized_summary_contexts:
+                        if not isinstance(message.get("content"), list):
+                            continue
+                        message["content"] = [
+                            (
+                                {
+                                    "type": "text",
+                                    "text": "[Image reference could not be sent by this provider adapter]",
+                                }
+                                if isinstance(part, dict)
+                                and part.get("type") == "image_url"
+                                and isinstance(part.get("image_url"), dict)
+                                and part["image_url"].get("id") in image_ids
+                                else part
+                            )
+                            for part in message["content"]
+                        ]
+                    image_ids.clear()
+                if image_ids:
+                    for message in sanitized_summary_contexts:
+                        if not isinstance(message.get("content"), list):
+                            continue
+                        for part in message["content"]:
+                            if (
+                                isinstance(part, dict)
+                                and part.get("type") == "image_url"
+                                and isinstance(part.get("image_url"), dict)
+                                and part["image_url"].get("id") in image_ids
+                            ):
+                                image_count += 1
+                                preview = self.image_context.projected_visuals[
+                                    part["image_url"]["id"]
+                                ]
+                                try:
+                                    encoded_bytes += 4 * (
+                                        (Path(preview).stat().st_size + 2) // 3
+                                    )
+                                except OSError:
+                                    pass
+            if self.image_context is not None:
+                scope = self.image_context.budget.scope(
+                    purpose="summary",
+                    provider_id=str(self.provider.provider_config.get("id", "")),
+                    model=self.provider.get_model(),
+                    image_count=image_count,
+                    encoded_bytes=encoded_bytes,
+                    authorization_check=lambda: (
+                        self.image_context.check_visual_authorization(image_ids)
+                    ),
+                )
+            with scope:
+                response = await self.provider.text_chat(
+                    contexts=sanitized_summary_contexts,
+                )
+            if self.image_context is not None:
+                self.image_context.budget.record_usage(
+                    response.usage,
+                    purpose="summary",
+                    provider_id=str(self.provider.provider_config.get("id", "")),
+                    model=self.provider.get_model(),
+                )
             summary_content = (response.completion_text or "").strip()
+        except ImageBudgetExceeded:
+            raise
         except Exception as e:
+            if self.image_context is not None and (
+                isinstance(e, MemoryError)
+                or (isinstance(e, OSError) and not is_recoverable_image_error(e))
+            ):
+                raise
             logger.error(f"Failed to generate summary: {e}")
             return messages
 
